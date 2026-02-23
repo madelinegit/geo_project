@@ -10,121 +10,90 @@ DB_PATH = "data/properties.db"
 DEFAULT_START = {
     "name": "Tahoe Getaways Office",
     "lat": 39.3279,
-    "lng": -120.1833
+    "lng": -120.1833,
 }
 
-CHECKIN_DEADLINE_HHMM = "16:00"  # 4PM hard deadline
+CHECKIN_DEADLINE_HHMM = "16:00"  # 4PM COMPLETION deadline (finish service by 4PM)
 
 
 # ---------------- TIME HELPERS ---------------- #
 
 def hhmm_to_minutes(hhmm: str) -> int:
-    try:
-        parts = hhmm.strip().split(":")
-        if len(parts) != 2:
-            raise ValueError
-        hh = int(parts[0])
-        mm = int(parts[1])
-        if hh < 0 or hh > 23 or mm < 0 or mm > 59:
-            raise ValueError
-        return hh * 60 + mm
-    except Exception:
-        raise ValueError("Invalid time format. Use HH:MM (24-hour).")
+    parts = (hhmm or "").strip().split(":")
+    if len(parts) != 2:
+        raise ValueError("Invalid time format. Use HH:MM.")
+    hh = int(parts[0])
+    mm = int(parts[1])
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        raise ValueError("Invalid time format. Use HH:MM.")
+    return hh * 60 + mm
 
 
 def minutes_to_hhmm(m: int) -> str:
     m = max(0, int(m))
-    hh = (m // 60) % 24
-    mm = m % 60
-    return f"{hh:02d}:{mm:02d}"
+    return f"{(m // 60) % 24:02d}:{m % 60:02d}"
 
 
-# ---------------- HOME ROUTE ---------------- #
+# ---------------- HOME ---------------- #
 
 @app.route("/")
 def home():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT "Property Name", "Unit Address", Latitude, Longitude
         FROM properties
         WHERE Latitude IS NOT NULL AND Longitude IS NOT NULL
-    """)
+        """
+    )
 
     rows = cursor.fetchall()
     conn.close()
 
     properties = []
     for r in rows:
-        properties.append({
-            "name": r[0],
-            "address": r[1],
-            "lat": float(r[2]),
-            "lng": float(r[3])
-        })
+        properties.append(
+            {
+                "name": r[0],
+                "address": r[1],
+                "lat": float(r[2]),
+                "lng": float(r[3]),
+            }
+        )
 
     return render_template(
         "map.html",
         properties=properties,
         property_count=len(properties),
-        default_start=DEFAULT_START
+        default_start=DEFAULT_START,
     )
 
 
-# ---------------- OPTIMIZE ROUTE ---------------- #
+# ---------------- ORTOOLS SOLVER ---------------- #
 
-def _validate_locations(start, stops):
-    # start must have coords
-    if not start or start.get("lat") is None or start.get("lng") is None:
-        raise ValueError("Start location must have lat/lng. Choose Office or a Property.")
-
-    # stops must have coords
-    cleaned = []
-    for s in stops:
-        if s.get("lat") is None or s.get("lng") is None:
-            continue
-        cleaned.append(s)
-
-    if not cleaned:
-        raise ValueError("No valid stops (missing lat/lng).")
-
-    return start, cleaned
-
-
-def _get_osrm_duration_matrix(all_locations):
-    coords = ";".join(f"{float(s['lng'])},{float(s['lat'])}" for s in all_locations)
-    matrix_url = f"http://router.project-osrm.org/table/v1/driving/{coords}?annotations=duration"
-
-    resp = requests.get(matrix_url, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError("OSRM matrix request failed")
-
-    matrix_data = resp.json()
-    durations = matrix_data.get("durations")
-    if not durations or any(row is None for row in durations):
-        raise RuntimeError("OSRM returned an invalid duration matrix")
-
-    return durations
-
-
-def _get_osrm_route_geometry(ordered_locations):
-    coords_final = ";".join(f"{float(s['lng'])},{float(s['lat'])}" for s in ordered_locations)
-    route_url = f"http://router.project-osrm.org/route/v1/driving/{coords_final}?overview=full&geometries=geojson"
-
-    route_resp = requests.get(route_url, timeout=30)
-    if route_resp.status_code != 200:
-        raise RuntimeError("OSRM route request failed")
-
-    route_data = route_resp.json()["routes"][0]
-    return route_data
-
-
-def _solve_route(duration_matrix, service_times_sec, checkin_deadline_offset_sec=None, checkin_flags=None):
+def _solve_route(
+    duration_matrix,
+    service_times_sec,
+    checkin_flags,
+    deadline_offset_sec=None,
+    hard_deadline=False,
+    soft_deadline_penalty=False,
+):
     """
-    Solves route with OR-Tools.
-    If checkin_deadline_offset_sec and checkin_flags provided, applies hard arrival windows.
-    Returns: ordered_nodes (includes start=0, ends with end node), arrival_times_sec aligned to ordered_nodes
+    Solves a single-vehicle TSP-like route.
+
+    duration_matrix: seconds travel time between nodes (size x size)
+    service_times_sec: seconds service time at each node (node 0 start = 0)
+    checkin_flags: bool list aligned to nodes (node 0 False)
+    deadline_offset_sec: seconds since route start corresponding to 4PM (deadline - start_time)
+    hard_deadline: if True, enforce check-ins must FINISH by deadline (hard constraint)
+    soft_deadline_penalty: if True, add penalty for check-ins finishing after deadline (soft objective)
+
+    Returns:
+      ordered_nodes (list of node ids, includes 0 at start and includes end which often maps to 0)
+      arrival_times_sec (aligned cumul arrival at each node position in ordered_nodes)
     """
     size = len(duration_matrix)
     manager = pywrapcp.RoutingIndexManager(size, 1, 0)
@@ -133,54 +102,50 @@ def _solve_route(duration_matrix, service_times_sec, checkin_deadline_offset_sec
     def time_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
-        travel_time = duration_matrix[from_node][to_node] or 0
-        service_time = service_times_sec[from_node]  # service at FROM node
-        return int(travel_time + service_time)
+        travel = duration_matrix[from_node][to_node] or 0
+        service = service_times_sec[from_node] or 0  # service at FROM node
+        return int(travel + service)
 
     transit_cb = routing.RegisterTransitCallback(time_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
 
-    # Time dimension: allow waiting by giving slack.
-    # If you set slack=0, time windows can become impossible even when a feasible sequence exists.
     horizon = 24 * 60 * 60
     routing.AddDimension(
         transit_cb,
-        horizon,   # slack max (waiting)
+        horizon,   # slack/waiting allowed
         horizon,   # max cumul
-        True,      # force start at 0
-        "Time"
+        True,      # start cumul at 0
+        "Time",
     )
     time_dim = routing.GetDimensionOrDie("Time")
 
-    # ----- HARD COMPLETION DEADLINE FOR CHECK-INS -----
+    # ---- Deadline handling (finish-by-4PM) ----
+    # Completion: finish_time = arrival_time + service_here <= deadline_offset
+    # So arrival_time <= deadline_offset - service_here
+    if deadline_offset_sec is not None and deadline_offset_sec >= 0:
+        # penalty coefficient: MUST be large vs travel seconds to push check-ins earlier
+        # (travel objective ~ seconds; penalty coefficient * seconds late)
+        PENALTY_PER_SEC_LATE = 5000
 
-checkin_deadline_offset_sec = (deadline_minutes - start_minutes) * 60
-
-for node_idx in range(1, size):
-    stop = all_locations[node_idx]
-    is_checkin = bool(stop.get("arrival", False))
-
-    if is_checkin:
-        idx = manager.NodeToIndex(node_idx)
-
-        service_time_here = service_times_sec[node_idx]
-
-        # Latest arrival so that finish <= 4PM
-        latest_arrival = checkin_deadline_offset_sec - service_time_here
-
-        if latest_arrival < 0:
-            latest_arrival = 0
-
-        time_dim.CumulVar(idx).SetRange(0, int(latest_arrival))
-
-
-    # Optional: Hard arrival window for check-ins
-    if checkin_deadline_offset_sec is not None and checkin_flags is not None:
         for node_idx in range(1, size):
-            if bool(checkin_flags[node_idx]):
-                idx = manager.NodeToIndex(node_idx)
-                # Must arrive by deadline offset (seconds since start)
-                time_dim.CumulVar(idx).SetRange(0, int(checkin_deadline_offset_sec))
+            if not bool(checkin_flags[node_idx]):
+                continue
+
+            idx = manager.NodeToIndex(node_idx)
+
+            service_here = int(service_times_sec[node_idx] or 0)
+            latest_arrival = int(deadline_offset_sec - service_here)
+            if latest_arrival < 0:
+                latest_arrival = 0
+
+            if hard_deadline:
+                # hard constraint: must arrive by latest_arrival
+                time_dim.CumulVar(idx).SetRange(0, latest_arrival)
+
+            if soft_deadline_penalty:
+                # soft constraint: penalize arriving after latest_arrival
+                # NOTE: this is arrival-based but represents completion because we subtract service_here above
+                time_dim.SetCumulVarSoftUpperBound(idx, latest_arrival, PENALTY_PER_SEC_LATE)
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -208,6 +173,8 @@ for node_idx in range(1, size):
     return ordered_nodes, arrival_times_sec
 
 
+# ---------------- OPTIMIZE ---------------- #
+
 @app.route("/optimize", methods=["POST"])
 def optimize():
     data = request.json or {}
@@ -225,130 +192,178 @@ def optimize():
 
     deadline_minutes = hhmm_to_minutes(CHECKIN_DEADLINE_HHMM)
 
+    # Make sure coords are numeric (avoid weird frontend nulls)
     try:
-        start, stops = _validate_locations(start, stops)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        start = {
+            "name": start.get("name"),
+            "lat": float(start.get("lat")),
+            "lng": float(start.get("lng")),
+        }
+    except Exception:
+        return jsonify({"error": "Start location must have valid lat/lng."}), 400
 
-    # Combine start + stops (node 0 is start)
-    all_locations = [start] + stops
+    cleaned_stops = []
+    for s in stops:
+        try:
+            cleaned_stops.append(
+                {
+                    "name": s.get("name"),
+                    "lat": float(s.get("lat")),
+                    "lng": float(s.get("lng")),
+                    "arrival": bool(s.get("arrival", False)),
+                    "serviceMinutes": int(s.get("serviceMinutes", 60)),
+                }
+            )
+        except Exception:
+            # skip any stop missing coords
+            continue
 
-    # OSRM travel times
-    try:
-        duration_matrix = _get_osrm_duration_matrix(all_locations)
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 500
+    if not cleaned_stops:
+        return jsonify({"error": "No valid stops (missing lat/lng)."}), 400
 
-    size = len(duration_matrix)
+    all_locations = [start] + cleaned_stops
 
-    # Service times per node (seconds). Node 0 (start) = 0
+    # OSRM MATRIX
+    coords = ";".join(f"{float(s['lng'])},{float(s['lat'])}" for s in all_locations)
+    matrix_url = f"http://router.project-osrm.org/table/v1/driving/{coords}?annotations=duration"
+
+    resp = requests.get(matrix_url, timeout=30)
+    if resp.status_code != 200:
+        return jsonify({"error": "OSRM matrix request failed"}), 500
+
+    duration_matrix = resp.json().get("durations")
+    if not duration_matrix:
+        return jsonify({"error": "Invalid matrix response"}), 500
+
+    # SERVICE TIMES (seconds); node 0 is start
     service_times_sec = [0]
-    for stop in stops:
-        minutes = int(stop.get("serviceMinutes", 60))
-        minutes = max(0, minutes)
-        service_times_sec.append(minutes * 60)
+    for s in cleaned_stops:
+        m = max(0, int(s.get("serviceMinutes", 60)))
+        service_times_sec.append(m * 60)
 
-    # Check-in flags aligned to all_locations index (0=start, 1..n stops)
-    checkin_flags = [False]
-    for stop in stops:
-        checkin_flags.append(bool(stop.get("arrival", False)))
+    # CHECK-IN FLAGS aligned to nodes
+    checkin_flags = [False] + [bool(s.get("arrival", False)) for s in cleaned_stops]
 
-    # Deadline offset seconds since start
-    checkin_deadline_offset_sec = (deadline_minutes - start_minutes) * 60
-
-    # If start is after 4PM, deadline logic is meaningless; we’ll still route, mark late.
     enforce_deadline = start_minutes < deadline_minutes
+    deadline_offset_sec = (deadline_minutes - start_minutes) * 60 if enforce_deadline else None
 
-    # 1) Try SOLVE WITH HARD TIME WINDOWS (Option 3 correct)
-    ordered_nodes, arrival_times_sec = (None, None)
+    # Option 3 behavior:
+    # 1) Try HARD completion-by-4PM for check-ins.
+    # 2) If infeasible, fallback to SOFT penalties (minimize lateness as much as possible).
+    ordered_nodes, arrival_times_sec = None, None
+    used_deadline_constraints = False
+    used_soft_penalties = False
+
     if enforce_deadline:
         ordered_nodes, arrival_times_sec = _solve_route(
             duration_matrix=duration_matrix,
             service_times_sec=service_times_sec,
-            checkin_deadline_offset_sec=checkin_deadline_offset_sec,
-            checkin_flags=checkin_flags
+            checkin_flags=checkin_flags,
+            deadline_offset_sec=deadline_offset_sec,
+            hard_deadline=True,
+            soft_deadline_penalty=False,
         )
+        if ordered_nodes is not None:
+            used_deadline_constraints = True
 
-    used_deadline_constraints = ordered_nodes is not None
-
-    # 2) Fallback: solve WITHOUT windows if infeasible
     if ordered_nodes is None:
+        # soft penalty solve (prioritizes check-ins earlier, even if not all can finish by 4)
         ordered_nodes, arrival_times_sec = _solve_route(
             duration_matrix=duration_matrix,
             service_times_sec=service_times_sec,
-            checkin_deadline_offset_sec=None,
-            checkin_flags=None
+            checkin_flags=checkin_flags,
+            deadline_offset_sec=deadline_offset_sec if enforce_deadline else None,
+            hard_deadline=False,
+            soft_deadline_penalty=True,
+        )
+        if ordered_nodes is not None:
+            used_soft_penalties = True
+
+    if ordered_nodes is None:
+        # final fallback: no deadline logic at all (should be rare)
+        ordered_nodes, arrival_times_sec = _solve_route(
+            duration_matrix=duration_matrix,
+            service_times_sec=service_times_sec,
+            checkin_flags=checkin_flags,
+            deadline_offset_sec=None,
+            hard_deadline=False,
+            soft_deadline_penalty=False,
         )
         if ordered_nodes is None:
             return jsonify({"error": "No solution found"}), 500
 
-    # ordered_nodes includes start and ends with end node. Extract stops only (exclude node 0 and final end node if present)
-    # In this model, the end node is a virtual end index; manager.IndexToNode(end) returns 0? No—here we used a single depot,
-    # routing ends at an end index that maps to node 0 as well in many cases; safest is:
-    ordered_stop_nodes = [n for n in ordered_nodes[1:] if n != 0]
-
-    # Build ordered stops objects (exclude start)
-    ordered_stops = [all_locations[n] for n in ordered_stop_nodes]
-
-    # Build geometry using OSRM route (start + ordered stops)
-    ordered_locations_for_geom = [start] + ordered_stops
-    try:
-        route_data = _get_osrm_route_geometry(ordered_locations_for_geom)
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 500
-
-    driving_duration = float(route_data["duration"])  # seconds
-    service_duration = sum(int(s.get("serviceMinutes", 60)) * 60 for s in ordered_stops)
-    total_duration = driving_duration + service_duration
-
-    # Build schedule and compute lateness (always compute late flags)
-    schedule = []
-    late_checkins = []
-
-    # arrival_times_sec aligns with ordered_nodes positions.
-    # We need the arrival time for each stop in ordered_stop_nodes order.
-    # Build mapping node->arrival_sec from the first occurrence in the route walk.
+    # Map node -> arrival seconds (first occurrence)
     node_arrival_sec = {}
     for pos, node in enumerate(ordered_nodes):
         if node not in node_arrival_sec:
             node_arrival_sec[node] = arrival_times_sec[pos]
 
+    # Extract stop nodes (exclude the first start, and exclude any 0 that appears at end)
+    ordered_stop_nodes = [n for n in ordered_nodes[1:] if n != 0]
+
+    ordered_stops = [all_locations[n] for n in ordered_stop_nodes]
+
+    # OSRM ROUTE GEOMETRY
+    coords_final = ";".join(f"{float(s['lng'])},{float(s['lat'])}" for s in [start] + ordered_stops)
+    route_url = f"http://router.project-osrm.org/route/v1/driving/{coords_final}?overview=full&geometries=geojson"
+    route_resp = requests.get(route_url, timeout=30)
+    if route_resp.status_code != 200:
+        return jsonify({"error": "OSRM route request failed"}), 500
+
+    route_data = route_resp.json().get("routes", [{}])[0]
+    if not route_data:
+        return jsonify({"error": "Invalid OSRM route response"}), 500
+
+    driving_duration = float(route_data.get("duration", 0.0))
+    service_duration = sum(int(s.get("serviceMinutes", 60)) * 60 for s in ordered_stops)
+    total_duration = driving_duration + service_duration
+
+    # BUILD SCHEDULE (completion-by-4PM lateness)
+    schedule = []
+    late_checkins = []
+
     for node in ordered_stop_nodes:
         stop = all_locations[node]
+
         eta_minutes = start_minutes + int(node_arrival_sec.get(node, 0) // 60)
+        service_min = int(stop.get("serviceMinutes", 60))
+        finish_minutes = eta_minutes + service_min
 
         is_checkin = bool(stop.get("arrival", False))
         is_late = False
-        finish_minutes = eta_minutes + int(stop.get("serviceMinutes", 60))
+        if is_checkin and finish_minutes > deadline_minutes:
+            is_late = True
+            late_checkins.append(stop.get("name"))
 
-    if is_checkin and finish_minutes > deadline_minutes:
-        is_late = True
-        late_checkins.append(stop.get("name"))
+        schedule.append(
+            {
+                "name": stop.get("name"),
+                "arrival": is_checkin,
+                "late": is_late,
+                "serviceMinutes": service_min,
+                "eta": minutes_to_hhmm(eta_minutes),
+                "eta_minutes": eta_minutes,
+                "lat": float(stop.get("lat")),
+                "lng": float(stop.get("lng")),
+            }
+        )
 
-        schedule.append({
-            "name": stop.get("name"),
-            "arrival": is_checkin,
-            "late": is_late,
-            "serviceMinutes": int(stop.get("serviceMinutes", 60)),
-            "eta": minutes_to_hhmm(eta_minutes),
-            "eta_minutes": eta_minutes,
-            "lat": float(stop.get("lat")),
-            "lng": float(stop.get("lng"))
-        })
-
-    return jsonify({
-        "distance": route_data["distance"],
-        "total_duration": total_duration,
-        "driving_duration": driving_duration,
-        "service_duration": service_duration,
-        "geometry": route_data["geometry"],
-        "ordered_stops": ordered_stops,  # keep for compatibility
-        "start_time": start_time_hhmm,
-        "checkin_deadline": CHECKIN_DEADLINE_HHMM,
-        "schedule": schedule,
-        "late_checkins": late_checkins,
-        "deadline_constraints_used": used_deadline_constraints
-    })
+    return jsonify(
+        {
+            "distance": route_data.get("distance", 0.0),
+            "total_duration": total_duration,
+            "driving_duration": driving_duration,
+            "service_duration": service_duration,
+            "geometry": route_data.get("geometry"),
+            "ordered_stops": ordered_stops,  # keep for compatibility
+            "start_time": start_time_hhmm,
+            "checkin_deadline": CHECKIN_DEADLINE_HHMM,
+            "schedule": schedule,
+            "late_checkins": late_checkins,
+            "deadline_constraints_used": used_deadline_constraints,
+            "soft_penalties_used": used_soft_penalties,
+        }
+    )
 
 
 if __name__ == "__main__":
