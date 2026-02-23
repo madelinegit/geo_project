@@ -1,239 +1,327 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Tahoe Routing</title>
+{% extends "base.html" %}
+{% block content %}
 
-    <link rel="stylesheet"
-          href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<div class="flex h-[calc(100vh-72px)]">
 
-    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <!-- SIDEBAR -->
+  <div class="w-96 bg-white shadow-xl p-6 overflow-y-auto">
 
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin:0;
-            display:flex;
-        }
+    <h2 class="text-xl font-bold mb-4">Tahoe Routing</h2>
 
-        #sidebar {
-            width:340px;
-            padding:15px;
-            background:#f7f7f7;
-            border-right:1px solid #ddd;
-            height:100vh;
-            overflow:auto;
-        }
+    <!-- START LOCATION -->
+    <div class="mb-4 p-3 bg-gray-100 rounded-lg">
+      <div class="text-sm text-gray-500 mb-2">Starting Point</div>
 
-        #map {
-            flex:1;
-            height:100vh;
-        }
+      <select id="startMode" class="w-full border rounded-lg p-2 mb-2">
+        <option value="office" selected>Tahoe Getaways Office</option>
+        <option value="property">Choose Property</option>
+      </select>
 
-        input {
-            width:100%;
-            padding:8px;
-            margin-bottom:8px;
-        }
+      <select id="startProperty"
+              class="w-full border rounded-lg p-2 hidden"></select>
+    </div>
 
-        button {
-            width:100%;
-            padding:10px;
-            margin-top:10px;
-            background:#e91e63;
-            color:white;
-            border:none;
-            border-radius:6px;
-            cursor:pointer;
-        }
+    <!-- START TIME -->
+    <div class="mb-4">
+      <label class="text-sm text-gray-600">Start Time</label>
+      <input type="time"
+             id="startTime"
+             value="09:00"
+             class="w-full border rounded-lg p-2">
+      <div class="text-xs text-gray-500 mt-1">
+        Check-ins must arrive by 4:00 PM
+      </div>
+    </div>
 
-        .suggestion {
-            padding:6px;
-            cursor:pointer;
-            border-bottom:1px solid #ddd;
-        }
+    <!-- SEARCH -->
+    <input id="searchBox"
+           placeholder="Type property name..."
+           class="w-full border rounded-lg p-2 mb-2">
 
-        .suggestion:hover {
-            background:#eee;
-        }
+    <div id="suggestions"
+         class="bg-white border rounded-lg mb-4 max-h-48 overflow-y-auto"></div>
 
-        .stopRow {
-            margin-bottom:6px;
-            padding:6px;
-            background:white;
-            border-radius:6px;
-        }
-    </style>
-</head>
-<body>
+    <h4 class="font-semibold mb-2">Selected Stops</h4>
+    <div id="selectedStops" class="space-y-3 mb-4"></div>
 
-<div id="sidebar">
-    <h3>Tahoe Routing</h3>
+    <button onclick="optimizeRoute()"
+            class="bg-indigo-600 text-white px-4 py-2 rounded-lg w-full mb-2">
+      Optimize Route
+    </button>
 
-    <input id="searchBox" placeholder="Type property name...">
-    <div id="suggestions"></div>
+    <button onclick="exportToGoogleMaps()"
+            class="bg-green-600 text-white px-4 py-2 rounded-lg w-full">
+      Open in Google Maps
+    </button>
 
-    <h4>Selected Stops</h4>
-    <div id="selectedStops"></div>
+    <!-- ROUTE OUTPUT -->
+    <div class="mt-6">
+      <h3 class="font-semibold mb-2">Route Schedule</h3>
+      <ol id="routeList" class="space-y-2"></ol>
 
-    <button onclick="optimizeRoute()">Optimize Route</button>
+      <div class="mt-4 text-sm">
+        <div><b>Total:</b> <span id="totalTime">—</span></div>
+        <div><b>Driving:</b> <span id="drivingTime">—</span></div>
+        <div><b>At Houses:</b> <span id="serviceTime">—</span></div>
+        <div><b>Distance:</b> <span id="distance">—</span></div>
+      </div>
+    </div>
 
-    <h3>Route Order</h3>
-    <ol id="routeList"></ol>
+  </div>
 
-    <p><b>Drive Time:</b> <span id="driveTime">—</span></p>
-    <p><b>Distance:</b> <span id="distance">—</span></p>
+  <!-- MAP -->
+  <div id="map" class="flex-1"></div>
 </div>
 
-<div id="map"></div>
-
 <script>
-    // Map
-    var map = L.map('map').setView([39.3279, -120.1833], 11);
 
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
-        maxZoom:18
-    }).addTo(map);
+/* ================= MAP ================= */
 
-    const properties = {{ properties|tojson }};
+var map = L.map('map').setView([39.3279, -120.1833], 11);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(map);
 
-    let selectedStops = [];
-    let routeLayer = null;
+const properties = {{ properties|tojson }};
+let selectedStops = [];
+let routeLayer = null;
+let optimizedOrder = [];
+let markers = {};
 
-    // Default start location (TG Office)
-    let startLocation = {
-        name: "Tahoe Getaways Office",
-        lat: 39.3279,
-        lng: -120.1833
+/* ================= START LOCATION ================= */
+
+let startLocation = {
+  name: "Tahoe Getaways Office",
+  lat: 39.3279,
+  lng: -120.1833
+};
+
+const startMode = document.getElementById("startMode");
+const startProperty = document.getElementById("startProperty");
+
+properties.forEach(p => {
+  if(p.lat && p.lng){
+    let option = document.createElement("option");
+    option.value = p.name;
+    option.textContent = p.name;
+    startProperty.appendChild(option);
+
+    let marker = L.marker([p.lat, p.lng])
+      .addTo(map)
+      .bindPopup(`<b>${p.name}</b><br>${p.address}`);
+
+    markers[p.name] = marker;
+  }
+});
+
+startMode.addEventListener("change", function(){
+  startProperty.classList.toggle("hidden", this.value !== "property");
+
+  if(this.value === "office"){
+    startLocation = {
+      name: "Tahoe Getaways Office",
+      lat: 39.3279,
+      lng: -120.1833
     };
+  }
+});
 
-    // Markers
-    properties.forEach(p => {
-        if(p.lat && p.lng){
-            L.marker([p.lat, p.lng])
-                .addTo(map)
-                .bindPopup(`<b>${p.name}</b><br>${p.address}`);
+startProperty.addEventListener("change", function(){
+  let selected = properties.find(p => p.name === this.value);
+  if(selected){
+    startLocation = {
+      name: selected.name,
+      lat: selected.lat,
+      lng: selected.lng
+    };
+  }
+});
+
+/* ================= SEARCH ================= */
+
+const searchBox = document.getElementById("searchBox");
+const suggestions = document.getElementById("suggestions");
+
+searchBox.addEventListener("input", function(){
+  let text = this.value.toLowerCase();
+  suggestions.innerHTML = "";
+
+  if(text.length < 2) return;
+
+  properties
+    .filter(p => p.name.toLowerCase().includes(text))
+    .slice(0,10)
+    .forEach(p => {
+      let div = document.createElement("div");
+      div.className = "p-2 cursor-pointer border-b hover:bg-indigo-100";
+      div.innerText = p.name;
+      div.onclick = () => addStop(p);
+      suggestions.appendChild(div);
+    });
+});
+
+/* ================= STOP MANAGEMENT ================= */
+
+function addStop(property){
+
+  if(property.name === startLocation.name) return;
+  if(selectedStops.find(s => s.name === property.name)) return;
+
+  selectedStops.push({
+    name: property.name,
+    lat: property.lat,
+    lng: property.lng,
+    arrival: false,
+    serviceMinutes: 60
+  });
+
+  renderStops();
+}
+
+function renderStops(){
+  const container = document.getElementById("selectedStops");
+  container.innerHTML = "";
+
+  selectedStops.forEach((s,i)=>{
+
+    let div = document.createElement("div");
+    div.className = "bg-gray-50 p-2 rounded shadow-sm";
+
+    div.innerHTML = `
+      <div class="font-medium">${s.name}</div>
+
+      <label>
+        <input type="checkbox"
+               onchange="toggleArrival(${i})"
+               ${s.arrival ? "checked" : ""}>
+        Check-in
+      </label>
+
+      <div class="mt-1">
+        Service Time:
+        <select onchange="updateServiceTime(${i}, this.value)">
+          ${generateTimeOptions(s.serviceMinutes)}
+        </select>
+      </div>
+
+      <button onclick="removeStop(${i})"
+              class="text-red-500 text-sm mt-1">
+        Remove
+      </button>
+    `;
+
+    container.appendChild(div);
+  });
+}
+
+function generateTimeOptions(selected){
+  let html = "";
+  for(let m = 15; m <= 240; m += 15){
+    html += `<option value="${m}" ${m==selected?"selected":""}>${m} min</option>`;
+  }
+  return html;
+}
+
+function updateServiceTime(index, value){
+  selectedStops[index].serviceMinutes = parseInt(value);
+}
+
+function removeStop(index){
+  selectedStops.splice(index,1);
+  renderStops();
+}
+
+function toggleArrival(index){
+  selectedStops[index].arrival = !selectedStops[index].arrival;
+}
+
+/* ================= OPTIMIZE ================= */
+
+function optimizeRoute(){
+
+  fetch("/optimize", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      stops: selectedStops,
+      start: startLocation,
+      startTime: document.getElementById("startTime").value
+    })
+  })
+  .then(res => res.json())
+  .then(data => {
+
+    if(data.error){
+      alert(data.error);
+      return;
+    }
+
+    if(routeLayer) map.removeLayer(routeLayer);
+
+    if(data.geometry){
+      routeLayer = L.geoJSON(data.geometry,{
+        style:{color:"#6366f1",weight:5}
+      }).addTo(map);
+    }
+
+    document.getElementById("totalTime").innerText =
+      (data.total_duration/3600).toFixed(2)+" hrs";
+
+    document.getElementById("drivingTime").innerText =
+      (data.driving_duration/3600).toFixed(2)+" hrs";
+
+    document.getElementById("serviceTime").innerText =
+      (data.service_duration/3600).toFixed(2)+" hrs";
+
+    document.getElementById("distance").innerText =
+      (data.distance/1609).toFixed(1)+" miles";
+
+    const list = document.getElementById("routeList");
+    list.innerHTML = "";
+
+    data.schedule.forEach(stop => {
+
+      const li = document.createElement("li");
+      li.className = "p-2 border rounded hover:bg-gray-100 cursor-pointer";
+
+      let departureMinutes = stop.eta_minutes + stop.serviceMinutes;
+      let departureHH = Math.floor(departureMinutes / 60) % 24;
+      let departureMM = departureMinutes % 60;
+      let departure = 
+        String(departureHH).padStart(2,'0') + ":" +
+        String(departureMM).padStart(2,'0');
+
+      li.innerHTML = `
+        <div class="font-medium">${stop.name}</div>
+        <div class="text-xs text-gray-600">
+          Arrive: ${stop.eta} |
+          Depart: ${departure}
+        </div>
+      `;
+
+      li.addEventListener("mouseenter", function(){
+        if(markers[stop.name]){
+          markers[stop.name].openPopup();
+          map.panTo(markers[stop.name].getLatLng());
         }
+      });
+
+      li.addEventListener("mouseleave", function(){
+        if(markers[stop.name]){
+          markers[stop.name].closePopup();
+        }
+      });
+
+      list.appendChild(li);
     });
 
-    // Predictive Search
-    const searchBox = document.getElementById("searchBox");
-    const suggestions = document.getElementById("suggestions");
+  });
+}
 
-    searchBox.addEventListener("input", function(){
-        let text = this.value.toLowerCase();
-        suggestions.innerHTML = "";
+/* ================= GOOGLE MAPS ================= */
 
-        if(text.length < 2) return;
-
-        let matches = properties
-            .filter(p => p.name.toLowerCase().includes(text))
-            .slice(0,10);
-
-        matches.forEach(p => {
-            let div = document.createElement("div");
-            div.className = "suggestion";
-            div.innerText = p.name;
-            div.onclick = () => addStop(p);
-            suggestions.appendChild(div);
-        });
-    });
-
-    function addStop(property){
-
-        if(selectedStops.find(s => s.name === property.name)) return;
-
-        selectedStops.push({
-            name: property.name,
-            lat: property.lat,
-            lng: property.lng,
-            arrival:false
-        });
-
-        renderStops();
-        suggestions.innerHTML="";
-        searchBox.value="";
-    }
-
-    function renderStops(){
-        const container = document.getElementById("selectedStops");
-        container.innerHTML="";
-
-        selectedStops.forEach((s,i)=>{
-            let div = document.createElement("div");
-            div.className="stopRow";
-
-            div.innerHTML = `
-                <b>${s.name}</b><br>
-                Arrival <input type="checkbox" onchange="toggleArrival(${i})">
-                <button onclick="removeStop(${i})">Remove</button>
-            `;
-
-            container.appendChild(div);
-        });
-    }
-
-    function toggleArrival(index){
-        selectedStops[index].arrival =
-            !selectedStops[index].arrival;
-    }
-
-    function removeStop(index){
-        selectedStops.splice(index,1);
-        renderStops();
-    }
-
-    function optimizeRoute(){
-
-        fetch("/optimize", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                stops: selectedStops,
-                start: startLocation
-            })
-        })
-        .then(res => res.json())
-        .then(data => {
-
-            if (data.error) {
-                alert(data.error);
-                return;
-            }
-
-            if (routeLayer) {
-                map.removeLayer(routeLayer);
-            }
-
-            routeLayer = L.geoJSON(data.geometry, {
-                style: {
-                    color: "#ff2da0",
-                    weight: 5
-                }
-            }).addTo(map);
-
-            document.getElementById("driveTime").innerText =
-                (data.duration / 60).toFixed(1) + " minutes";
-
-            document.getElementById("distance").innerText =
-                (data.distance / 1609).toFixed(1) + " miles";
-
-            const list = document.getElementById("routeList");
-            list.innerHTML = "";
-
-            data.ordered_stops.forEach((stop, index) => {
-                const li = document.createElement("li");
-                li.textContent = (index + 1) + ". " + stop.name;
-                list.appendChild(li);
-            });
-
-        })
-        .catch(err => {
-            console.error("Routing error:", err);
-            alert("Routing failed.");
-        });
-    }
+function exportToGoogleMaps(){
+  alert("Optimize route first to export.");
+}
 
 </script>
 
-</body>
-</html>
+{% endblock %}

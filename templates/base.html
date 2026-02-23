@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{% block title %}Tahoe Routing{% endblock %}</title>
+
+    <!-- Tailwind -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- Leaflet -->
+    <link rel="stylesheet"
+          href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+    <!-- Your custom CSS -->
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='styles.css') }}">
+</head>
+
+<body class="bg-gray-100">
+
+    <!-- Top Navbar (for future login) -->
+    <nav class="bg-white shadow-md px-6 py-4 flex justify-between">
+        <h1 class="font-bold text-lg">Tahoe Routing</h1>
+        <div>
+            <!-- Placeholder for login later -->
+            <a href="#" class="text-blue-600">Login</a>
+        </div>
+    </nav>
+
+    {% block content %}{% endblock %}
+
+</body>
+</html>
