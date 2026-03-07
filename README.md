@@ -66,7 +66,7 @@ reload_db.py = deterministic, repeatable synchronization
 This keeps the system clean, modular, and reproducible.
 
 
-🔎 Quick Database Sanity Check
+🔎 Quick Database Check
 
 To verify DB integrity:
 
