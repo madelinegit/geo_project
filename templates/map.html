@@ -132,6 +132,15 @@ properties.forEach(p => {
   }
 });
 
+// initialize start location from UI
+//if(startMode.value === "office"){
+  //startLocation = {
+    //name: "Tahoe Getaways Office",
+    //lat: 39.3279,
+    //lng: -120.1833
+  //};
+//}
+
 startMode.addEventListener("change", function(){
   startProperty.classList.toggle("hidden", this.value !== "property");
 
@@ -340,6 +349,14 @@ function optimizeRoute(){
     routeLayer = L.geoJSON(data.geometry,{
       style:{color:"#6366f1",weight:5}
     }).addTo(map);
+
+      // draw start marker
+      let startMarker = L.marker([startLocation.lat, startLocation.lng], {
+        icon: regularIcon
+      }).addTo(map)
+        .bindPopup("<b>Start</b><br>" + startLocation.name);
+
+      activeRouteMarkers.push(startMarker);
 
     document.getElementById("totalTime").innerText =
       (data.total_duration/3600).toFixed(2)+" hrs";
