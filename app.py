@@ -755,22 +755,6 @@ def optimize():
 #  PORTFOLIO  (public — no login required)
 # ══════════════════════════════════════════════════════════════════
 
-@app.route("/portfolio")
-def portfolio():
-    conn   = get_db()
-    cursor = conn.execute(
-        'SELECT "Property Name", "Unit Address", Latitude, Longitude FROM properties '
-        'WHERE Latitude IS NOT NULL AND Longitude IS NOT NULL '
-        'ORDER BY "Property Name" ASC'
-    )
-    rows = cursor.fetchall()
-    conn.close()
-
-    properties = [
-        {"name": r[0], "address": r[1], "lat": float(r[2]), "lng": float(r[3])}
-        for r in rows
-    ]
-    return render_template("portfolio.html", properties=properties)
 
 
 # ══════════════════════════════════════════════════════════════════
