@@ -47,6 +47,50 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+def init_db():
+    conn = get_db()
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT DEFAULT 'user',
+        password_hash TEXT NOT NULL,
+        is_active INTEGER DEFAULT 1,
+        reset_token TEXT,
+        reset_token_expires TEXT,
+        created_at TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS saved_routes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        route_date TEXT,
+        stops_json TEXT,
+        total_duration REAL,
+        driving_duration REAL,
+        service_duration REAL,
+        distance REAL,
+        created_by INTEGER,
+        last_edited_by INTEGER,
+        created_at TEXT,
+        updated_at TEXT
+    )""")
+    # Seed admin user if none exists
+    from werkzeug.security import generate_password_hash
+    from datetime import datetime
+    existing = conn.execute("SELECT id FROM users WHERE role='admin'").fetchone()
+    if not existing:
+        admin_password = os.environ.get("ADMIN_PASSWORD", "ChangeMe123!")
+        conn.execute(
+            "INSERT INTO users (email, name, role, password_hash, is_active, created_at) VALUES (?,?,?,?,1,?)",
+            ("operations@tahoegetaways.com", "Admin", "admin",
+             generate_password_hash(admin_password), datetime.utcnow().isoformat())
+        )
+    conn.commit()
+    conn.close()
+
+with app.app_context():
+    init_db()
+
 
 # ══════════════════════════════════════════════════════════════════
 #  USER MODEL
